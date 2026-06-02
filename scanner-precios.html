@@ -619,6 +619,7 @@
       </div>
     </div>
     <div class="scan-hint">Apuntá el código de barras</div>
+    <div style="margin-top:12px;font-size:11px;color:rgba(255,255,255,0.5);text-align:center;padding:0 20px">Si no funciona: Configuración > Safari > Cámara > Permitir</div>
   </div>
   <button class="btn-close-scanner" id="closeScannerBtn">✕</button>
 </div>
@@ -802,31 +803,85 @@ async function startScanner() {
   scannerActive = true;
 
   try {
-    const ZXing = window.ZXing;
-    codeReader = new ZXing.BrowserMultiFormatReader();
-
-    const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
-    // prefer back camera
-    let deviceId = devices[0]?.deviceId;
-    const back = devices.find(d => d.label.toLowerCase().includes('back') || d.label.toLowerCase().includes('tras') || d.label.toLowerCase().includes('environment'));
-    if(back) deviceId = back.deviceId;
-
-    await codeReader.decodeFromVideoDevice(deviceId, 'video-preview', (result, err) => {
-      if(result && scannerActive) {
-        const code = result.getText();
-        stopScanner();
-        handleScannedCode(code);
-        if(navigator.vibrate) navigator.vibrate(50);
+    // Request camera with environment facing (back camera on iPhone)
+    const constraints = {
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
       }
-    });
+    };
+
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const video = document.getElementById('video-preview');
+    video.srcObject = stream;
+    video.setAttribute('playsinline', true);
+    await video.play();
+
+    // Store stream for cleanup
+    window._scanStream = stream;
+
+    // Use BarcodeDetector if available (Chrome/Android), else ZXing
+    if('BarcodeDetector' in window) {
+      const detector = new BarcodeDetector({ formats: ['ean_13','ean_8','code_128','code_39','qr_code','upc_a','upc_e','itf','codabar','data_matrix'] });
+      
+      function detect() {
+        if(!scannerActive) return;
+        detector.detect(video).then(barcodes => {
+          if(barcodes.length > 0 && scannerActive) {
+            const code = barcodes[0].rawValue;
+            stopScanner();
+            handleScannedCode(code);
+            if(navigator.vibrate) navigator.vibrate(50);
+          } else {
+            requestAnimationFrame(detect);
+          }
+        }).catch(() => requestAnimationFrame(detect));
+      }
+      requestAnimationFrame(detect);
+
+    } else {
+      // Fallback: ZXing
+      const ZXing = window.ZXing;
+      if(!ZXing) { stopScanner(); showToast('Librería no disponible', 'error'); return; }
+      codeReader = new ZXing.BrowserMultiFormatReader();
+      const hints = new Map();
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      codeReader.hints = hints;
+
+      // Decode from already-playing video stream
+      codeReader.decodeFromStream(stream, video, (result, err) => {
+        if(result && scannerActive) {
+          const code = result.getText();
+          stopScanner();
+          handleScannedCode(code);
+          if(navigator.vibrate) navigator.vibrate(50);
+        }
+      });
+    }
+
   } catch(e) {
     stopScanner();
-    showToast('No se pudo acceder a la cámara', 'error');
+    if(e.name === 'NotAllowedError') {
+      showToast('Permiso de cámara denegado — revisá Safari > Configuración', 'error');
+    } else if(e.name === 'NotFoundError') {
+      showToast('No se encontró cámara en este dispositivo', 'error');
+    } else {
+      showToast('Error al iniciar cámara: ' + e.message, 'error');
+    }
+    console.error('Camera error:', e);
   }
 }
 
 function stopScanner() {
   scannerActive = false;
+  // Stop all tracks
+  if(window._scanStream) {
+    window._scanStream.getTracks().forEach(t => t.stop());
+    window._scanStream = null;
+  }
+  const video = document.getElementById('video-preview');
+  video.srcObject = null;
   if(codeReader) { try { codeReader.reset(); } catch(e){} codeReader = null; }
   document.getElementById('scannerContainer').classList.remove('active');
 }
